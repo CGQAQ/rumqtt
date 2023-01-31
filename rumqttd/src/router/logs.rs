@@ -115,12 +115,16 @@ impl DataLog {
         }
     }
 
-    pub fn next_native_offset(&mut self, filter: &str) -> (FilterIdx, Offset) {
+    pub fn next_native_offset(
+        &mut self,
+        filter: &str,
+        group: Option<String>,
+    ) -> (FilterIdx, Offset) {
         let publish_filters = &mut self.publish_filters;
         let filter_indexes = &mut self.filter_indexes;
 
         let (filter_idx, data) = match filter_indexes.get(filter) {
-            Some(idx) => (*idx, self.native.get(*idx).unwrap()),
+            Some(idx) => (*idx, self.native.get_mut(*idx).unwrap()),
             None => {
                 let data = Data::new(
                     filter,
@@ -140,11 +144,18 @@ impl DataLog {
                     }
                 }
 
-                (idx, self.native.get(idx).unwrap())
+                (idx, self.native.get_mut(idx).unwrap())
             }
         };
 
-        (filter_idx, data.log.next_offset())
+        let offset = data.log.next_offset();
+        if let Some(group_name) = group {
+            if !data.shared_cursors.contains_key(&group_name) {
+                data.shared_cursors.insert(group_name, offset);
+            };
+        }
+
+        (filter_idx, offset)
     }
 
     pub fn native_readv(
@@ -163,7 +174,11 @@ impl DataLog {
         // reflect that. Consequently, this method is also infallible.
         // Encoding this information is important so that calling function
         // has more information on how this method behaves.
+
+        // let offset = offset.xor(data.shared_cursor).unwrap();
+        // let offset = offset.unwrap_or(data.shared_cursor.unwrap());
         let next = data.log.readv(offset, len, &mut o)?;
+
         Ok((next, o))
     }
 
@@ -229,6 +244,7 @@ pub struct Data<T> {
     pub log: CommitLog<T>,
     pub waiters: Waiters<DataRequest>,
     meter: SubscriptionMeter,
+    pub(crate) shared_cursors: HashMap<String, (u64, u64)>,
 }
 
 impl<T> Data<T>
@@ -240,11 +256,13 @@ where
 
         let waiters = Waiters::with_capacity(10);
         let metrics = SubscriptionMeter::default();
+
         Data {
             filter: filter.to_owned(),
             log,
             waiters,
             meter: metrics,
+            shared_cursors: HashMap::new(),
         }
     }
 

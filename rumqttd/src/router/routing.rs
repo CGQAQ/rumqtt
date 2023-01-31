@@ -586,6 +586,8 @@ impl Router {
                         info!("Adding subscription on topic {}", f.path);
                         let connection = self.connections.get_mut(id).unwrap();
 
+                        // NOTE: we can pass only connection.tenant_prefix instead on whole
+                        // connection!
                         if let Err(e) = validate_subscription(connection, f) {
                             warn!(reason = ?e,"Subscription cannot be validated: {}", e);
 
@@ -593,11 +595,18 @@ impl Router {
                             break;
                         }
 
-                        let filter = &f.path;
+                        let mut filter = f.path.as_str();
+                        let mut group = None;
+                        if filter.starts_with("$share") {
+                            let tmp_filter = filter.trim_start_matches("$share/");
+                            let (group_name, f) = tmp_filter.split_once('/').unwrap();
+                            (filter, group) = (f, Some(group_name.to_string()));
+                        }
+
                         let qos = f.qos;
 
-                        let (idx, cursor) = self.datalog.next_native_offset(filter);
-                        self.prepare_filter(id, cursor, idx, filter.clone(), qos as u8);
+                        let (idx, cursor) = self.datalog.next_native_offset(filter, group.clone());
+                        self.prepare_filter(id, cursor, idx, filter.to_string(), qos as u8, group);
                         self.datalog
                             .handle_retained_messages(filter, &mut self.notifications);
 
@@ -831,6 +840,7 @@ impl Router {
         filter_idx: FilterIdx,
         filter: String,
         qos: u8,
+        group: Option<String>,
     ) {
         // Add connection id to subscription list
         match self.subscription_map.get_mut(&filter) {
@@ -855,6 +865,7 @@ impl Router {
                 cursor,
                 read_count: 0,
                 max_count: 100,
+                group,
             };
 
             self.scheduler.track(id, request);
@@ -1114,7 +1125,7 @@ fn append_to_commitlog(
     let filter_idxs = match filter_idxs {
         Some(v) => v,
         None if connections[id].dynamic_filters => {
-            let (idx, _cursor) = datalog.next_native_offset(topic);
+            let (idx, _cursor) = datalog.next_native_offset(topic, None);
             vec![idx]
         }
         None => return Err(RouterError::NoMatchingFilters(topic.to_owned())),
@@ -1186,12 +1197,19 @@ enum ConsumeStatus {
 /// 3. `inflight_full`: whether the inflight requests were completely filled
 fn forward_device_data(
     request: &mut DataRequest,
-    datalog: &DataLog,
+    datalog: &mut DataLog,
     outgoing: &mut Outgoing,
     alertlog: &mut AlertLog,
 ) -> ConsumeStatus {
     let span = tracing::info_span!("outgoing_publish", client_id = outgoing.client_id);
     let _guard = span.enter();
+
+    let data = datalog.native.get(request.filter_idx).unwrap();
+
+    if let Some(group_name) = &request.group {
+        request.cursor = *data.shared_cursors.get(group_name).unwrap();
+    }
+
     trace!(
         "Reading from datalog: {}[{}, {}]",
         request.filter,
@@ -1260,6 +1278,13 @@ fn forward_device_data(
     let filter_idx = request.filter_idx;
     request.read_count += publishes.len();
     request.cursor = next;
+
+    let data = datalog.native.get_mut(request.filter_idx).unwrap();
+    if let Some(group_name) = &request.group {
+        data.shared_cursors
+            .insert(group_name.to_string(), request.cursor)
+            .unwrap();
+    }
     // println!("{:?} {:?} {}", start, next, request.read_count);
 
     if publishes.is_empty() {
@@ -1407,9 +1432,11 @@ fn validate_subscription(
         return Err(RouterError::UnsupportedQoS(filter.qos));
     }
 
-    if filter.path.starts_with('$') {
+    if filter.path.starts_with('$') && !filter.path.starts_with("$share") {
         return Err(RouterError::InvalidFilterPrefix(filter.path.to_owned()));
     }
+
+    // TODO: Handle shared subscription verification!!
 
     Ok(())
 }

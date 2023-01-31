@@ -188,6 +188,7 @@ pub struct DataRequest {
     pub read_count: usize,
     /// Maximum count of payload buffer per replica
     max_count: usize,
+    group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
