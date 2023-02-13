@@ -13,7 +13,7 @@ use slab::Slab;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
@@ -437,8 +437,9 @@ impl Router {
             connection.events.events.pop_front();
         }
 
+        let session_expiry_interval = connection.expiry_interval.unwrap_or(0);
         // Save state for persistent sessions
-        if !connection.clean {
+        if !connection.clean && session_expiry_interval > 0 {
             // Add inflight data requests back to tracker
             inflight_data_requests
                 .into_iter()
@@ -450,12 +451,20 @@ impl Router {
                 }
             }
 
-            self.graveyard
-                .save(tracker, connection.subscriptions, connection.events);
+            self.graveyard.save(
+                tracker,
+                connection.subscriptions,
+                connection.events,
+                Some(Instant::now() + Duration::from_secs(session_expiry_interval.into())),
+            );
         } else {
             // Only save metrics in clean session
-            self.graveyard
-                .save(Tracker::new(client_id), HashSet::new(), connection.events);
+            self.graveyard.save(
+                Tracker::new(client_id),
+                HashSet::new(),
+                connection.events,
+                None,
+            );
         }
         self.router_meters.total_connections -= 1;
     }
