@@ -73,8 +73,10 @@ impl<P: Protocol> RemoteLink<P> {
         })
         .await??;
 
-        let (connect, lastwill, login) = match packet {
-            Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
+        let (connect, connect_props, lastwill, login) = match packet {
+            Packet::Connect(connect, connect_props, lastwill, _, login) => {
+                (connect, connect_props, lastwill, login)
+            }
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
@@ -107,6 +109,12 @@ impl<P: Protocol> RemoteLink<P> {
         let client_id = connect.client_id.clone();
         let clean_session = connect.clean_session;
 
+        let session_expiry_interval = if let Some(props) = connect_props {
+            props.session_expiry_interval
+        } else {
+            None
+        };
+
         // Don't allow empty client_id
         if client_id.is_empty() {
             return Err(Error::InvalidClientId);
@@ -117,6 +125,7 @@ impl<P: Protocol> RemoteLink<P> {
             &client_id,
             router_tx,
             clean_session,
+            session_expiry_interval,
             lastwill,
             dynamic_filters,
         )?;

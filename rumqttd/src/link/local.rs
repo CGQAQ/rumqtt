@@ -43,6 +43,7 @@ impl Link {
         tenant_id: Option<String>,
         client_id: &str,
         clean: bool,
+        expiry_interval: Option<u32>,
         last_will: Option<LastWill>,
         dynamic_filters: bool,
     ) -> (
@@ -55,6 +56,7 @@ impl Link {
             tenant_id,
             client_id.to_owned(),
             clean,
+            expiry_interval,
             last_will,
             dynamic_filters,
         );
@@ -78,14 +80,21 @@ impl Link {
         client_id: &str,
         router_tx: Sender<(ConnectionId, Event)>,
         clean: bool,
+        expiry_interval: Option<u32>,
         last_will: Option<LastWill>,
         dynamic_filters: bool,
     ) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
 
-        let (message, i, o, link_rx) =
-            Link::prepare(tenant_id, client_id, clean, last_will, dynamic_filters);
+        let (message, i, o, link_rx) = Link::prepare(
+            tenant_id,
+            client_id,
+            clean,
+            expiry_interval,
+            last_will,
+            dynamic_filters,
+        );
         router_tx.send((0, message))?;
 
         link_rx.recv()?;
@@ -108,14 +117,21 @@ impl Link {
         client_id: &str,
         router_tx: Sender<(ConnectionId, Event)>,
         clean: bool,
+        session_expiry: Option<u32>,
         last_will: Option<LastWill>,
         dynamic_filters: bool,
     ) -> Result<(LinkTx, LinkRx, ConnAck), LinkError> {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
 
-        let (message, i, o, link_rx) =
-            Link::prepare(tenant_id, client_id, clean, last_will, dynamic_filters);
+        let (message, i, o, link_rx) = Link::prepare(
+            tenant_id,
+            client_id,
+            clean,
+            session_expiry,
+            last_will,
+            dynamic_filters,
+        );
         router_tx.send_async((0, message)).await?;
 
         link_rx.recv_async().await?;
