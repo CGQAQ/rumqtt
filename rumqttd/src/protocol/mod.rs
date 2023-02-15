@@ -5,7 +5,7 @@ pub mod v5;
 #[cfg(feature = "websockets")]
 pub mod ws;
 
-use std::{io, str::Utf8Error, string::FromUtf8Error};
+use std::{io, str::Utf8Error, string::FromUtf8Error, time::Instant};
 
 /// This module is the place where all the protocol specifics gets abstracted
 /// out and creates a structures which are common across protocols. Since,

@@ -1,6 +1,6 @@
 use crate::protocol::{
     ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason,
-    PubRel, PubRelReason, Publish, QoS, SubAck, SubscribeReasonCode, UnsubAck,
+    PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck, SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -13,7 +13,7 @@ use slab::Slab;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
@@ -487,7 +487,7 @@ impl Router {
 
         for packet in packets.drain(0..) {
             match packet {
-                Packet::Publish(publish, _) => {
+                Packet::Publish(publish, props) => {
                     let span =
                         tracing::info_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
@@ -545,6 +545,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish.clone(),
+                        props,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -737,6 +738,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish,
+                        None,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -958,6 +960,7 @@ impl Router {
         match append_to_commitlog(
             id,
             publish,
+            None,
             &mut self.datalog,
             &mut self.notifications,
             &mut self.connections,
@@ -1082,6 +1085,7 @@ fn append_to_alertlog(alert: Alert, alertlog: &mut AlertLog) -> Result<Offset, R
 fn append_to_commitlog(
     id: ConnectionId,
     mut publish: Publish,
+    publish_props: Option<PublishProperties>,
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
@@ -1099,10 +1103,18 @@ fn append_to_commitlog(
         }
     }
 
+    let exp = if let Some(ref props) = publish_props {
+        props
+            .message_expiry_interval
+            .map(|t| Instant::now() + Duration::from_secs(t as u64))
+    } else {
+        None
+    };
+
     if publish.payload.is_empty() {
         datalog.remove_from_retained_publishes(topic.to_owned());
     } else if publish.retain {
-        datalog.insert_to_retained_publishes(publish.clone(), topic.to_owned());
+        datalog.insert_to_retained_publishes(publish.clone(), publish_props, topic.to_owned());
     }
 
     publish.retain = false;
@@ -1123,7 +1135,7 @@ fn append_to_commitlog(
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
         let datalog = datalog.native.get_mut(filter_idx).unwrap();
-        let (offset, filter) = datalog.append(publish.clone(), notifications);
+        let (offset, filter) = datalog.append((publish.clone(), exp), notifications);
         debug!(
             pkid,
             "Appended to commitlog: {}[{}, {})", filter, offset.0, offset.1,

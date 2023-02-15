@@ -3,7 +3,8 @@ use slab::Slab;
 use tracing::trace;
 
 use crate::protocol::{
-    matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, SubAck, UnsubAck,
+    matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, PublishProperties,
+    SubAck, UnsubAck,
 };
 use crate::router::{DataRequest, FilterIdx, SubscriptionMeter, Waiters};
 use crate::{ConnectionId, Filter, Offset, RouterConfig, Topic};
@@ -12,6 +13,7 @@ use crate::segments::{CommitLog, Position};
 use crate::Storage;
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::time::{Duration, Instant};
 
 /// Stores 'device' data and 'actions' data in native commitlog
 /// organized by subscription filter. Device data is replicated
@@ -25,10 +27,10 @@ pub struct DataLog {
     /// Also has waiters used to wake connections/replicator tracker
     /// which are caught up with all the data on 'Filter' and waiting
     /// for new data
-    pub native: Slab<Data<Publish>>,
+    pub native: Slab<Data<(Publish, Option<Instant>)>>,
     /// Map of subscription filter name to filter index
     filter_indexes: HashMap<Filter, FilterIdx>,
-    retained_publishes: HashMap<Topic, Publish>,
+    retained_publishes: HashMap<Topic, (Publish, Option<Instant>)>,
     /// List of filters associated with a topic
     publish_filters: HashMap<Topic, Vec<FilterIdx>>,
 }
@@ -164,12 +166,22 @@ impl DataLog {
         // Encoding this information is important so that calling function
         // has more information on how this method behaves.
         let next = data.log.readv(offset, len, &mut o)?;
+        let now = Instant::now();
+        o.retain(|x| {
+            if let Some(exp) = x.0 .1 {
+                exp > now
+            } else {
+                true
+            }
+        });
+        let o = o.into_iter().map(|elem| (elem.0 .0, elem.1)).collect();
         Ok((next, o))
     }
 
     pub fn shadow(&mut self, filter: &str) -> Option<Publish> {
         let data = self.native.get_mut(*self.filter_indexes.get(filter)?)?;
-        data.log.last()
+        // TODO: check shadow expiry!
+        data.log.last().map(|f| f.0)
     }
 
     /// This method is called when the subscriber has caught up with the commit log. In which case,
@@ -197,8 +209,20 @@ impl DataLog {
         inflight
     }
 
-    pub fn insert_to_retained_publishes(&mut self, publish: Publish, topic: Topic) {
-        self.retained_publishes.insert(topic, publish);
+    pub fn insert_to_retained_publishes(
+        &mut self,
+        publish: Publish,
+        publish_properties: Option<PublishProperties>,
+        topic: Topic,
+    ) {
+        let exp = if let Some(props) = publish_properties {
+            props
+                .message_expiry_interval
+                .map(|t| Instant::now() + Duration::from_secs(t as u64))
+        } else {
+            None
+        };
+        self.retained_publishes.insert(topic, (publish, exp));
     }
 
     pub fn remove_from_retained_publishes(&mut self, topic: Topic) {

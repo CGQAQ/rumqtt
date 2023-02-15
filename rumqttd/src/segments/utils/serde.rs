@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::protocol::Publish;
 use crate::Storage;
 use bytes::Bytes;
@@ -12,6 +14,13 @@ impl Storage for Bytes {
 impl Storage for Publish {
     fn size(&self) -> usize {
         4 + self.topic.len() + self.payload.len()
+    }
+}
+
+impl Storage for (Publish, Option<Instant>) {
+    fn size(&self) -> usize {
+        let (publish, _) = self;
+        4 + publish.topic.len() + publish.payload.len()
     }
 }
 
