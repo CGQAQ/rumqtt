@@ -3,7 +3,8 @@ use slab::Slab;
 use tracing::trace;
 
 use crate::protocol::{
-    matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, SubAck, UnsubAck,
+    matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, PublishProperties,
+    SubAck, UnsubAck,
 };
 use crate::router::{DataRequest, FilterIdx, SubscriptionMeter, Waiters};
 use crate::{ConnectionId, Filter, Offset, RouterConfig, Topic};
@@ -25,10 +26,10 @@ pub struct DataLog {
     /// Also has waiters used to wake connections/replicator tracker
     /// which are caught up with all the data on 'Filter' and waiting
     /// for new data
-    pub native: Slab<Data<Publish>>,
+    pub native: Slab<Data<(Publish, Option<PublishProperties>)>>,
     /// Map of subscription filter name to filter index
     filter_indexes: HashMap<Filter, FilterIdx>,
-    retained_publishes: HashMap<Topic, Publish>,
+    retained_publishes: HashMap<Topic, (Publish, Option<PublishProperties>)>,
     /// List of filters associated with a topic
     publish_filters: HashMap<Topic, Vec<FilterIdx>>,
 }
@@ -152,7 +153,10 @@ impl DataLog {
         filter_idx: FilterIdx,
         offset: Offset,
         len: u64,
-    ) -> io::Result<(Position, Vec<(Publish, Offset)>)> {
+    ) -> io::Result<(
+        Position,
+        Vec<((Publish, Option<PublishProperties>), Offset)>,
+    )> {
         // unwrap to get index of `self.native` is fine here, because when a new subscribe packet
         // arrives in `Router::handle_device_payload`, it first calls the function
         // `next_native_offset` which creates a new commitlog if one doesn't exist. So any new
@@ -167,7 +171,7 @@ impl DataLog {
         Ok((next, o))
     }
 
-    pub fn shadow(&mut self, filter: &str) -> Option<Publish> {
+    pub fn shadow(&mut self, filter: &str) -> Option<(Publish, Option<PublishProperties>)> {
         let data = self.native.get_mut(*self.filter_indexes.get(filter)?)?;
         data.log.last()
     }
@@ -197,8 +201,13 @@ impl DataLog {
         inflight
     }
 
-    pub fn insert_to_retained_publishes(&mut self, publish: Publish, topic: Topic) {
-        self.retained_publishes.insert(topic, publish);
+    pub fn insert_to_retained_publishes(
+        &mut self,
+        publish: Publish,
+        properties: Option<PublishProperties>,
+        topic: Topic,
+    ) {
+        self.retained_publishes.insert(topic, (publish, properties));
     }
 
     pub fn remove_from_retained_publishes(&mut self, topic: Topic) {

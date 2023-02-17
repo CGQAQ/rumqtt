@@ -113,6 +113,7 @@ pub struct Forward {
     pub cursor: (u64, u64),
     pub size: usize,
     pub publish: Publish,
+    pub props: Option<PublishProperties>,
 }
 
 #[derive(Debug, Clone)]

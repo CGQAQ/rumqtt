@@ -1,6 +1,6 @@
 use crate::protocol::{
     ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason,
-    PubRel, PubRelReason, Publish, QoS, SubAck, SubscribeReasonCode, UnsubAck,
+    PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck, SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -489,7 +489,7 @@ impl Router {
 
         for packet in packets.drain(0..) {
             match packet {
-                Packet::Publish(publish, _) => {
+                Packet::Publish(publish, pubprops) => {
                     let span =
                         tracing::info_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
@@ -547,6 +547,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish.clone(),
+                        pubprops,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -575,7 +576,7 @@ impl Router {
                         );
                     };
                 }
-                Packet::Subscribe(subscribe, _) => {
+                Packet::Subscribe(subscribe, sub_props) => {
                     let mut return_codes = Vec::new();
                     let pkid = subscribe.pkid;
                     // let len = s.len();
@@ -598,8 +599,14 @@ impl Router {
                         let filter = &f.path;
                         let qos = f.qos;
 
+                        let sub_id = if let Some(ref props) = sub_props {
+                            props.id
+                        } else {
+                            None
+                        };
+
                         let (idx, cursor) = self.datalog.next_native_offset(filter);
-                        self.prepare_filter(id, cursor, idx, filter.clone(), qos as u8);
+                        self.prepare_filter(id, cursor, idx, filter.clone(), sub_id, qos as u8);
                         self.datalog
                             .handle_retained_messages(filter, &mut self.notifications);
 
@@ -739,6 +746,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish,
+                        None,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -832,6 +840,7 @@ impl Router {
         cursor: Offset,
         filter_idx: FilterIdx,
         filter: String,
+        subscription_id: Option<usize>,
         qos: u8,
     ) {
         // Add connection id to subscription list
@@ -864,6 +873,10 @@ impl Router {
             debug_assert!(self.scheduler.check_tracker_duplicates(id).is_none())
         }
 
+        if let Some(sub_id) = subscription_id {
+            connection.subscription_ids.insert(filter.clone(), sub_id);
+        };
+
         let meter = &mut self.ibufs.get_mut(id).unwrap().meter;
         meter.register_subscription(filter);
     }
@@ -895,6 +908,7 @@ impl Router {
         // We always try to ack when ever a connection is scheduled
         ack_device_data(ackslog, outgoing);
 
+        let conn = self.connections.get(id).unwrap();
         // A new connection's tracker is always initialized with acks request.
         // A subscribe will register data request.
         // So a new connection is always scheduled with at least one request
@@ -911,7 +925,7 @@ impl Router {
                 }
             };
 
-            match forward_device_data(&mut request, datalog, outgoing, alertlog) {
+            match forward_device_data(conn, &mut request, datalog, outgoing, alertlog) {
                 ConsumeStatus::BufferFull => {
                     requests.push_back(request);
                     self.scheduler.pause(id, PauseReason::Busy);
@@ -949,6 +963,7 @@ impl Router {
             None => return,
         };
 
+        // TODO: Publish properties??
         let publish = Publish {
             dup: false,
             qos: will.qos,
@@ -960,6 +975,7 @@ impl Router {
         match append_to_commitlog(
             id,
             publish,
+            None,
             &mut self.datalog,
             &mut self.notifications,
             &mut self.connections,
@@ -1084,6 +1100,7 @@ fn append_to_alertlog(alert: Alert, alertlog: &mut AlertLog) -> Result<Offset, R
 fn append_to_commitlog(
     id: ConnectionId,
     mut publish: Publish,
+    props: Option<PublishProperties>,
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
@@ -1104,7 +1121,7 @@ fn append_to_commitlog(
     if publish.payload.is_empty() {
         datalog.remove_from_retained_publishes(topic.to_owned());
     } else if publish.retain {
-        datalog.insert_to_retained_publishes(publish.clone(), topic.to_owned());
+        datalog.insert_to_retained_publishes(publish.clone(), props.clone(), topic.to_owned());
     }
 
     publish.retain = false;
@@ -1125,7 +1142,7 @@ fn append_to_commitlog(
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
         let datalog = datalog.native.get_mut(filter_idx).unwrap();
-        let (offset, filter) = datalog.append(publish.clone(), notifications);
+        let (offset, filter) = datalog.append((publish.clone(), props.clone()), notifications);
         debug!(
             pkid,
             "Appended to commitlog: {}[{}, {})", filter, offset.0, offset.1,
@@ -1187,6 +1204,7 @@ enum ConsumeStatus {
 /// 2. `done`: whether the connection was busy or not.
 /// 3. `inflight_full`: whether the inflight requests were completely filled
 fn forward_device_data(
+    connection: &Connection,
     request: &mut DataRequest,
     datalog: &DataLog,
     outgoing: &mut Outgoing,
@@ -1269,14 +1287,27 @@ fn forward_device_data(
     }
 
     // Fill and notify device data
-    let forwards = publishes.into_iter().map(|(mut publish, offset)| {
-        publish.qos = protocol::qos(qos).unwrap();
-        Forward {
-            cursor: offset,
-            size: 0,
-            publish,
-        }
-    });
+    let forwards = publishes
+        .into_iter()
+        .map(|((mut publish, pubprops), offset)| {
+            publish.qos = protocol::qos(qos).unwrap();
+            let pubprops = if let Some(subid) = connection.subscription_ids.get(&request.filter) {
+                // add subid to publish property here!
+
+                let mut prop = pubprops.unwrap_or_default();
+                prop.subscription_identifiers.push(*subid);
+                Some(prop)
+            } else {
+                None
+            };
+
+            Forward {
+                cursor: offset,
+                size: 0,
+                publish,
+                props: pubprops,
+            }
+        });
 
     let (len, inflight) = outgoing.push_forwards(forwards, qos, filter_idx);
 
@@ -1307,7 +1338,7 @@ fn forward_device_data(
 
 fn retrieve_shadow(datalog: &mut DataLog, outgoing: &mut Outgoing, shadow: ShadowRequest) {
     if let Some(reply) = datalog.shadow(&shadow.filter) {
-        let publish = reply;
+        let publish = reply.0;
         let shadow_reply = router::ShadowReply {
             topic: publish.topic,
             payload: publish.payload,

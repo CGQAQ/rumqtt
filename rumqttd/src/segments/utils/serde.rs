@@ -1,4 +1,4 @@
-use crate::protocol::Publish;
+use crate::protocol::{Publish, PublishProperties};
 use crate::Storage;
 use bytes::Bytes;
 
@@ -9,9 +9,9 @@ impl Storage for Bytes {
     }
 }
 
-impl Storage for Publish {
+impl Storage for (Publish, Option<PublishProperties>) {
     fn size(&self) -> usize {
-        4 + self.topic.len() + self.payload.len()
+        4 + self.0.topic.len() + self.0.payload.len()
     }
 }
 
