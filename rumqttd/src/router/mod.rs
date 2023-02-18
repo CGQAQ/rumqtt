@@ -97,6 +97,9 @@ impl From<Notification> for MaybePacket {
     fn from(notification: Notification) -> Self {
         let packet: Packet = match notification {
             Notification::Forward(forward) => Packet::Publish(forward.publish, None),
+            Notification::ForwardWithProperties(forward, props) => {
+                Packet::Publish(forward.publish, Some(props))
+            }
             Notification::DeviceAck(ack) => ack.into(),
             Notification::Unschedule => return None,
             v => {
