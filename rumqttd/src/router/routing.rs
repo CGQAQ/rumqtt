@@ -596,8 +596,13 @@ impl Router {
                             break;
                         }
 
-                        let filter = &f.path;
-                        let qos = f.qos;
+                        let protocol::Filter {
+                            path: filter,
+                            qos,
+                            nolocal,
+                            preserve_retain,
+                            retain_forward_rule,
+                        } = f;
 
                         let sub_id = if let Some(ref props) = sub_props {
                             props.id
@@ -606,7 +611,15 @@ impl Router {
                         };
 
                         let (idx, cursor) = self.datalog.next_native_offset(filter);
-                        self.prepare_filter(id, cursor, idx, filter.clone(), sub_id, qos as u8);
+                        self.prepare_filter(
+                            id,
+                            cursor,
+                            idx,
+                            filter.clone(),
+                            sub_id,
+                            *qos as u8,
+                            *nolocal,
+                        );
                         self.datalog
                             .handle_retained_messages(filter, &mut self.notifications);
 
@@ -842,6 +855,7 @@ impl Router {
         filter: String,
         subscription_id: Option<usize>,
         qos: u8,
+        nolocal: bool,
     ) {
         // Add connection id to subscription list
         match self.subscription_map.get_mut(&filter) {
@@ -866,6 +880,7 @@ impl Router {
                 cursor,
                 read_count: 0,
                 max_count: 100,
+                nolocal,
             };
 
             self.scheduler.track(id, request);
