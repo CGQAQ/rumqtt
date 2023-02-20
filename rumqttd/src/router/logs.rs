@@ -3,7 +3,8 @@ use slab::Slab;
 use tracing::trace;
 
 use crate::protocol::{
-    matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, SubAck, UnsubAck,
+    matches, ConnAck, ConnAckProperties, PingResp, PubAck, PubComp, PubRec, PubRel, Publish,
+    SubAck, UnsubAck,
 };
 use crate::router::{DataRequest, FilterIdx, SubscriptionMeter, Waiters};
 use crate::{ConnectionId, Filter, Offset, RouterConfig, Topic};
@@ -288,8 +289,8 @@ impl AckLog {
         }
     }
 
-    pub fn connack(&mut self, id: ConnectionId, ack: ConnAck) {
-        let ack = Ack::ConnAck(id, ack);
+    pub fn connack(&mut self, id: ConnectionId, ack: ConnAck, props: ConnAckProperties) {
+        let ack = Ack::ConnAck(id, ack, props);
         self.committed.push_back(ack);
     }
 

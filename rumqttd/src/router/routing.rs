@@ -1,6 +1,7 @@
 use crate::protocol::{
-    ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason,
-    PubRel, PubRelReason, Publish, QoS, SubAck, SubscribeReasonCode, UnsubAck,
+    ConnAck, ConnAckProperties, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp,
+    PubCompReason, PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck,
+    SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -342,8 +343,13 @@ impl Router {
             code: ConnectReturnCode::Success,
         };
 
+        let props = ConnAckProperties {
+            topic_alias_max: Some(1024),
+            ..Default::default()
+        };
+
         let ackslog = self.ackslog.get_mut(connection_id).unwrap();
-        ackslog.connack(connection_id, ack);
+        ackslog.connack(connection_id, ack, props);
 
         self.scheduler
             .reschedule(connection_id, ScheduleReason::Init);
@@ -489,7 +495,7 @@ impl Router {
 
         for packet in packets.drain(0..) {
             match packet {
-                Packet::Publish(publish, _) => {
+                Packet::Publish(publish, props) => {
                     let span =
                         tracing::info_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
@@ -547,6 +553,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish.clone(),
+                        props,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -739,6 +746,7 @@ impl Router {
                     match append_to_commitlog(
                         id,
                         publish,
+                        None,
                         &mut self.datalog,
                         &mut self.notifications,
                         &mut self.connections,
@@ -957,9 +965,11 @@ impl Router {
             pkid: 0,
             payload: will.message,
         };
+        // TODO: Publish Properties in last will
         match append_to_commitlog(
             id,
             publish,
+            None,
             &mut self.datalog,
             &mut self.notifications,
             &mut self.connections,
@@ -1084,11 +1094,12 @@ fn append_to_alertlog(alert: Alert, alertlog: &mut AlertLog) -> Result<Offset, R
 fn append_to_commitlog(
     id: ConnectionId,
     mut publish: Publish,
+    properties: Option<PublishProperties>,
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
 ) -> Result<Offset, RouterError> {
-    let topic = std::str::from_utf8(&publish.topic)?;
+    let mut topic = std::str::from_utf8(&publish.topic)?;
 
     // Ensure that only clients associated with a tenant can publish to tenant's topic
     #[cfg(feature = "validate-tenant-prefix")]
@@ -1110,12 +1121,34 @@ fn append_to_commitlog(
     publish.retain = false;
     let pkid = publish.pkid;
 
+    let connection = connections.get_mut(id).unwrap();
+
+    // parse topic alises
+
+    if let Some(PublishProperties {
+        topic_alias: Some(alias),
+        ..
+    }) = properties
+    {
+        if topic.is_empty() {
+            if let Some(alias_topic) = connection.topic_aliases.get(&alias) {
+                topic = alias_topic;
+            } else {
+                // TODO: Disconnect with reason code 0x82
+                error!("Invalid Alias")
+            }
+        } else {
+            connection.topic_aliases.insert(alias, topic.to_string());
+            trace!("Set alise {alias} for {topic}");
+        }
+    }
+
     let filter_idxs = datalog.matches(topic);
 
     // Create a dynamic filter if dynamic_filters are enabled for this connection
     let filter_idxs = match filter_idxs {
         Some(v) => v,
-        None if connections[id].dynamic_filters => {
+        None if connection.dynamic_filters => {
             let (idx, _cursor) = datalog.next_native_offset(topic);
             vec![idx]
         }

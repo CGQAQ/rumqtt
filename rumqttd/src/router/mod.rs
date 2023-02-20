@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     protocol::{
-        ConnAck, Packet, PingResp, PubAck, PubAckProperties, PubComp, PubCompProperties, PubRec,
-        PubRecProperties, PubRel, PubRelProperties, Publish, PublishProperties, SubAck,
-        SubAckProperties, UnsubAck,
+        ConnAck, ConnAckProperties, Packet, PingResp, PubAck, PubAckProperties, PubComp,
+        PubCompProperties, PubRec, PubRecProperties, PubRel, PubRelProperties, Publish,
+        PublishProperties, SubAck, SubAckProperties, UnsubAck,
     },
     ConnectionId, Filter, RouterConfig, RouterId, Topic,
 };
@@ -118,7 +118,7 @@ pub struct Forward {
 #[derive(Debug, Clone)]
 #[allow(clippy::enum_variant_names)]
 pub enum Ack {
-    ConnAck(ConnectionId, ConnAck),
+    ConnAck(ConnectionId, ConnAck, ConnAckProperties),
     PubAck(PubAck),
     PubAckWithProperties(PubAck, PubAckProperties),
     SubAck(SubAck),
@@ -136,7 +136,7 @@ pub enum Ack {
 impl From<Ack> for Packet {
     fn from(value: Ack) -> Self {
         match value {
-            Ack::ConnAck(_id, connack) => Packet::ConnAck(connack, None),
+            Ack::ConnAck(_id, connack, props) => Packet::ConnAck(connack, Some(props)),
             Ack::PubAck(puback) => Packet::PubAck(puback, None),
             Ack::PubAckWithProperties(puback, prop) => Packet::PubAck(puback, Some(prop)),
             Ack::SubAck(suback) => Packet::SubAck(suback, None),
