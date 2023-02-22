@@ -1,7 +1,7 @@
 use crate::protocol::{
-    ConnAck, ConnAckProperties, ConnectReturnCode, DisconnectReasonCode, Packet, PingResp, PubAck,
-    PubAckReason, PubComp, PubCompReason, PubRel, PubRelReason, Publish, PublishProperties, QoS,
-    SubAck, SubscribeReasonCode, UnsubAck,
+    ConnAck, ConnAckProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, Packet,
+    PingResp, PubAck, PubAckReason, PubComp, PubCompReason, PubRel, PubRelReason, Publish,
+    PublishProperties, QoS, SubAck, SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -55,6 +55,8 @@ pub enum RouterError {
 }
 
 type FilterWithOffsets = Vec<(Filter, Offset)>;
+
+const TOPIC_ALIAS_MAX: u16 = 4096;
 
 pub struct Router {
     id: RouterId,
@@ -240,7 +242,9 @@ impl Router {
             Event::GetMeter(meter) => self.handle_get_meter(id, meter),
             Event::NewAlert(tx, filters) => self.handle_new_alert(tx, filters),
             Event::DeviceData => self.handle_device_payload(id),
-            Event::Disconnect(disconnect) => self.handle_disconnection(id, disconnect.execute_will),
+            Event::Disconnect(disconnect) => {
+                self.handle_disconnection(id, disconnect.execute_will, None)
+            }
             Event::Ready => self.scheduler.reschedule(id, ScheduleReason::Ready),
             Event::Shadow(request) => {
                 retrieve_shadow(&mut self.datalog, &mut self.obufs[id], request)
@@ -274,7 +278,7 @@ impl Router {
                     "Duplicate client_id, dropping previous connection with connection_id: {}",
                     connection_id
                 );
-                self.handle_disconnection(*connection_id, true);
+                self.handle_disconnection(*connection_id, true, None);
             }
         }
 
@@ -346,8 +350,7 @@ impl Router {
         };
 
         let props = ConnAckProperties {
-            // TODO: Set some appropriate max
-            topic_alias_max: Some(u16::MAX),
+            topic_alias_max: Some(TOPIC_ALIAS_MAX),
             ..Default::default()
         };
 
@@ -383,7 +386,12 @@ impl Router {
         ));
     }
 
-    fn handle_disconnection(&mut self, id: ConnectionId, execute_last_will: bool) {
+    fn handle_disconnection(
+        &mut self,
+        id: ConnectionId,
+        execute_last_will: bool,
+        reason: Option<DisconnectReasonCode>,
+    ) {
         // Some clients can choose to send Disconnect packet before network disconnection.
         // This will lead to double Disconnect packets in router `events`
         let client_id = match &self.obufs.get(id) {
@@ -412,6 +420,26 @@ impl Router {
 
         info!("Disconnecting connection");
 
+        if let Some(reason_code) = reason {
+            let outgoing = match self.obufs.get_mut(id) {
+                Some(v) => v,
+                None => {
+                    error!("no-connection id {} is already gone", id);
+                    return;
+                }
+            };
+
+            let disconnect = Disconnect { reason_code };
+
+            let disconnect_notification = Notification::Disconnect(disconnect, None);
+
+            outgoing
+                .data_buffer
+                .lock()
+                .push_back(disconnect_notification);
+            outgoing.handle.try_send(()).ok();
+        }
+
         // if disconenct_packet {
         //     self.obufs.
         //     // send packet
@@ -426,7 +454,7 @@ impl Router {
         self.ackslog.remove(id);
 
         // Don't remove connection id from readyqueue with index. This will
-        // remove wrong connection from readyqueue. Instead just leave diconnected
+        // remove wrong connection from readyqueue. Instead just leave disconnected
         // connection in readyqueue and allow 'consume()' method to deal with this
         // self.readyqueue.remove(id);
 
@@ -497,6 +525,7 @@ impl Router {
         let mut force_ack = false;
         let mut new_data = false;
         let mut disconnect = false;
+        let mut disconnect_reason: Option<DisconnectReasonCode> = None;
         let mut execute_will = true;
 
         // info!("{:15.15}[I] {:20} count = {}", client_id, "packets", packets.len());
@@ -579,6 +608,11 @@ impl Router {
                             );
                             self.router_meters.failed_publishes += 1;
                             disconnect = true;
+
+                            if let RouterError::Disconnect(code) = e {
+                                disconnect_reason = Some(code);
+                            }
+
                             break;
                         }
                     };
@@ -835,7 +869,7 @@ impl Router {
         // on say 5th packet should not block new data notifications for packets
         // 1 - 4. Hence we use a flag instead of diconnecting immediately
         if disconnect {
-            self.handle_disconnection(id, execute_will);
+            self.handle_disconnection(id, execute_will, disconnect_reason);
         }
     }
 
@@ -1145,8 +1179,8 @@ fn append_to_commitlog(
         ..
     }) = properties
     {
-        if alias == 0 {
-            error!("Alias must be greater than 0");
+        if alias == 0 || alias > TOPIC_ALIAS_MAX {
+            error!("Alias must be greater than 0 and <={TOPIC_ALIAS_MAX}");
             return Err(RouterError::Disconnect(
                 DisconnectReasonCode::TopicAliasInvalid,
             ));

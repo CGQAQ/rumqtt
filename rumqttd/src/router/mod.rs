@@ -88,7 +88,7 @@ pub enum Notification {
     /// Shadow
     Shadow(ShadowReply),
     Unschedule,
-    Disconnect(Disconnect, DisconnectProperties),
+    Disconnect(Disconnect, Option<DisconnectProperties>),
 }
 
 type MaybePacket = Option<Packet>;
@@ -103,6 +103,7 @@ impl From<Notification> for MaybePacket {
             }
             Notification::DeviceAck(ack) => ack.into(),
             Notification::Unschedule => return None,
+            Notification::Disconnect(disconnect, props) => Packet::Disconnect(disconnect, props),
             v => {
                 tracing::error!("Unexpected notification here, it cannot be converted into Packet, Notification: {:?}", v);
                 return None;
