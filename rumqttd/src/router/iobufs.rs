@@ -117,7 +117,14 @@ impl Outgoing {
         if qos == 0 {
             for p in publishes {
                 self.meter.publish_count += 1;
-                buffer.push_back(Notification::Forward(p));
+
+                let notif = if p.props.is_some() {
+                    let props = p.props.clone().unwrap();
+                    Notification::ForwardWithProperties(p, props)
+                } else {
+                    Notification::Forward(p)
+                };
+                buffer.push_back(notif);
                 // self.meter.total_size += p.len();
             }
 

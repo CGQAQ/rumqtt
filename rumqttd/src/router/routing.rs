@@ -344,7 +344,8 @@ impl Router {
         };
 
         let props = ConnAckProperties {
-            topic_alias_max: Some(1024),
+            // TODO: Set some appropriate max
+            topic_alias_max: Some(u16::MAX),
             ..Default::default()
         };
 
@@ -409,6 +410,11 @@ impl Router {
 
         info!("Disconnecting connection");
 
+        // if disconenct_packet {
+        //     self.obufs.
+        //     // send packet
+        // }
+        //
         // Remove connection from router
         let mut connection = self.connections.remove(id);
         let _incoming = self.ibufs.remove(id);
@@ -664,6 +670,10 @@ impl Router {
                                 continue;
                             }
 
+                            if let Some(alias) = connection.broker_topic_aliases.remove(filter) {
+                                connection.used_aliases.remove(alias as usize);
+                            };
+
                             let unsuback = UnsubAck {
                                 pkid,
                                 // reasons are used in MQTTv5
@@ -903,6 +913,9 @@ impl Router {
         // We always try to ack when ever a connection is scheduled
         ack_device_data(ackslog, outgoing);
 
+        let connection = &mut self.connections[id];
+        let max_alias = connection.topic_alias_max;
+
         // A new connection's tracker is always initialized with acks request.
         // A subscribe will register data request.
         // So a new connection is always scheduled with at least one request
@@ -919,7 +932,17 @@ impl Router {
                 }
             };
 
-            match forward_device_data(&mut request, datalog, outgoing, alertlog) {
+            let broker_topic_aliases = &mut connection.broker_topic_aliases;
+            let used_aliases = &mut connection.used_aliases;
+            match forward_device_data(
+                &mut request,
+                datalog,
+                outgoing,
+                alertlog,
+                broker_topic_aliases,
+                used_aliases,
+                max_alias,
+            ) {
                 ConsumeStatus::BufferFull => {
                     requests.push_back(request);
                     self.scheduler.pause(id, PauseReason::Busy);
@@ -1130,12 +1153,19 @@ fn append_to_commitlog(
         ..
     }) = properties
     {
+        if alias == 0 {
+            error!("Alias must be greater than 0");
+            //TODO: return proper error!
+            return Err(RouterError::Disconnected);
+        }
         if topic.is_empty() {
             if let Some(alias_topic) = connection.topic_aliases.get(&alias) {
                 topic = alias_topic;
             } else {
                 // TODO: Disconnect with reason code 0x82
-                error!("Invalid Alias")
+                error!("Invalid Alias");
+                //TODO: return proper error!
+                return Err(RouterError::Disconnected);
             }
         } else {
             connection.topic_aliases.insert(alias, topic.to_string());
@@ -1224,6 +1254,9 @@ fn forward_device_data(
     datalog: &DataLog,
     outgoing: &mut Outgoing,
     alertlog: &mut AlertLog,
+    broker_topic_aliases: &mut HashMap<Filter, u16>,
+    used_aliases: &mut Slab<()>,
+    max_alias: u16,
 ) -> ConsumeStatus {
     let span = tracing::info_span!("outgoing_publish", client_id = outgoing.client_id);
     let _guard = span.enter();
@@ -1301,14 +1334,55 @@ fn forward_device_data(
         return ConsumeStatus::FilterCaughtup;
     }
 
+    let mut set_alias = max_alias > 0;
+    let topic_alias = if max_alias > 0 {
+        if let Some(alias) = broker_topic_aliases.get(&request.filter) {
+            // use this alias
+            set_alias = false;
+            Some(*alias)
+        } else {
+            let alias_to_use = used_aliases.insert(());
+            if alias_to_use > max_alias as usize {
+                used_aliases.remove(alias_to_use);
+                None
+            } else {
+                let alias_to_use = alias_to_use as u16;
+                broker_topic_aliases.insert(request.filter.clone(), alias_to_use);
+                Some(alias_to_use)
+            }
+        }
+    } else {
+        None
+    };
+
+    dbg!(topic_alias);
+    dbg!(set_alias);
+    dbg!(&request);
+
     // Fill and notify device data
     let forwards = publishes.into_iter().map(|(mut publish, offset)| {
         publish.qos = protocol::qos(qos).unwrap();
-        Forward {
+        // TODO: get this props from DataLog
+        let mut props = None;
+        if topic_alias.is_some() {
+            let newprops = PublishProperties {
+                topic_alias,
+                ..Default::default()
+            };
+
+            if !set_alias {
+                dbg!(publish.topic.clear())
+            }
+
+            props = Some(newprops);
+        }
+
+        dbg!(Forward {
             cursor: offset,
             size: 0,
             publish,
-        }
+            props,
+        })
     });
 
     let (len, inflight) = outgoing.push_forwards(forwards, qos, filter_idx);

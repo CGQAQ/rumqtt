@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     protocol::{
-        ConnAck, ConnAckProperties, Packet, PingResp, PubAck, PubAckProperties, PubComp,
-        PubCompProperties, PubRec, PubRecProperties, PubRel, PubRelProperties, Publish,
-        PublishProperties, SubAck, SubAckProperties, UnsubAck,
+        ConnAck, ConnAckProperties, Disconnect, DisconnectProperties, Packet, PingResp, PubAck,
+        PubAckProperties, PubComp, PubCompProperties, PubRec, PubRecProperties, PubRel,
+        PubRelProperties, Publish, PublishProperties, SubAck, SubAckProperties, UnsubAck,
     },
     ConnectionId, Filter, RouterConfig, RouterId, Topic,
 };
@@ -88,6 +88,7 @@ pub enum Notification {
     /// Shadow
     Shadow(ShadowReply),
     Unschedule,
+    Disconnect(Disconnect, DisconnectProperties),
 }
 
 type MaybePacket = Option<Packet>;
@@ -97,6 +98,9 @@ impl From<Notification> for MaybePacket {
     fn from(notification: Notification) -> Self {
         let packet: Packet = match notification {
             Notification::Forward(forward) => Packet::Publish(forward.publish, None),
+            Notification::ForwardWithProperties(forward, props) => {
+                Packet::Publish(forward.publish, Some(props))
+            }
             Notification::DeviceAck(ack) => ack.into(),
             Notification::Unschedule => return None,
             v => {
@@ -113,6 +117,7 @@ pub struct Forward {
     pub cursor: (u64, u64),
     pub size: usize,
     pub publish: Publish,
+    pub props: Option<PublishProperties>,
 }
 
 #[derive(Debug, Clone)]

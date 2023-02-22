@@ -1,7 +1,7 @@
 use crate::link::local::{Link, LinkError, LinkRx, LinkTx};
 use crate::link::network;
 use crate::link::network::Network;
-use crate::protocol::{Connect, Packet, Protocol};
+use crate::protocol::{Connect, ConnectProperties, Packet, Protocol};
 use crate::router::{Event, Notification};
 use crate::{ConnectionId, ConnectionSettings};
 
@@ -73,8 +73,10 @@ impl<P: Protocol> RemoteLink<P> {
         })
         .await??;
 
-        let (connect, lastwill, login) = match packet {
-            Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
+        let (connect, props, lastwill, login) = match packet {
+            Packet::Connect(connect, props, lastwill, _, login) => {
+                (connect, props, lastwill, login)
+            }
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
@@ -106,6 +108,15 @@ impl<P: Protocol> RemoteLink<P> {
         // start the link. Router can sometimes reject the connection (ex max connection limit)
         let client_id = connect.client_id.clone();
         let clean_session = connect.clean_session;
+        let mut client_topic_alias_max = None;
+        if let Some(ConnectProperties {
+            topic_alias_max, ..
+        }) = props
+        {
+            if topic_alias_max.is_some() {
+                client_topic_alias_max = topic_alias_max;
+            }
+        };
 
         if cfg!(feature = "allow-duplicate-clientid") {
             if !clean_session && client_id.is_empty() {
@@ -122,6 +133,7 @@ impl<P: Protocol> RemoteLink<P> {
             clean_session,
             lastwill,
             dynamic_filters,
+            client_topic_alias_max,
         )?;
         let id = link_rx.id();
         Span::current().record("connection_id", id);
