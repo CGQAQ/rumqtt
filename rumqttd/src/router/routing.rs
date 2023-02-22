@@ -1,7 +1,7 @@
 use crate::protocol::{
-    ConnAck, ConnAckProperties, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp,
-    PubCompReason, PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck,
-    SubscribeReasonCode, UnsubAck,
+    ConnAck, ConnAckProperties, ConnectReturnCode, DisconnectReasonCode, Packet, PingResp, PubAck,
+    PubAckReason, PubComp, PubCompReason, PubRel, PubRelReason, Publish, PublishProperties, QoS,
+    SubAck, SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -50,6 +50,8 @@ pub enum RouterError {
     InvalidFilterPrefix(Filter),
     #[error("Invalid client_id {0}")]
     InvalidClientId(String),
+    #[error("Disconnection")]
+    Disconnect(DisconnectReasonCode),
 }
 
 type FilterWithOffsets = Vec<(Filter, Offset)>;
@@ -1122,7 +1124,7 @@ fn append_to_commitlog(
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     connections: &mut Slab<Connection>,
 ) -> Result<Offset, RouterError> {
-    let mut topic = std::str::from_utf8(&publish.topic)?;
+    let topic = std::str::from_utf8(&publish.topic)?;
 
     // Ensure that only clients associated with a tenant can publish to tenant's topic
     #[cfg(feature = "validate-tenant-prefix")]
@@ -1135,6 +1137,34 @@ fn append_to_commitlog(
         }
     }
 
+    let connection = connections.get_mut(id).unwrap();
+
+    // parse topic alises
+    if let Some(PublishProperties {
+        topic_alias: Some(alias),
+        ..
+    }) = properties
+    {
+        if alias == 0 {
+            error!("Alias must be greater than 0");
+            return Err(RouterError::Disconnect(
+                DisconnectReasonCode::TopicAliasInvalid,
+            ));
+        }
+
+        if topic.is_empty() {
+            let Some(alias_topic) = connection.topic_aliases.get(&alias) else {
+                error!("Empty topic name with invalid alias");
+                return Err(RouterError::Disconnect(DisconnectReasonCode::ProtocolError));
+            };
+            publish.topic = alias_topic.to_owned().into();
+        } else {
+            connection.topic_aliases.insert(alias, topic.to_string());
+            trace!("Set alise {alias} for {topic}");
+        }
+    }
+
+    let topic = std::str::from_utf8(&publish.topic)?;
     if publish.payload.is_empty() {
         datalog.remove_from_retained_publishes(topic.to_owned());
     } else if publish.retain {
@@ -1143,35 +1173,6 @@ fn append_to_commitlog(
 
     publish.retain = false;
     let pkid = publish.pkid;
-
-    let connection = connections.get_mut(id).unwrap();
-
-    // parse topic alises
-
-    if let Some(PublishProperties {
-        topic_alias: Some(alias),
-        ..
-    }) = properties
-    {
-        if alias == 0 {
-            error!("Alias must be greater than 0");
-            //TODO: return proper error!
-            return Err(RouterError::Disconnected);
-        }
-        if topic.is_empty() {
-            if let Some(alias_topic) = connection.topic_aliases.get(&alias) {
-                topic = alias_topic;
-            } else {
-                // TODO: Disconnect with reason code 0x82
-                error!("Invalid Alias");
-                //TODO: return proper error!
-                return Err(RouterError::Disconnected);
-            }
-        } else {
-            connection.topic_aliases.insert(alias, topic.to_string());
-            trace!("Set alise {alias} for {topic}");
-        }
-    }
 
     let filter_idxs = datalog.matches(topic);
 
@@ -1334,30 +1335,20 @@ fn forward_device_data(
         return ConsumeStatus::FilterCaughtup;
     }
 
-    let mut set_alias = max_alias > 0;
-    let topic_alias = if max_alias > 0 {
-        if let Some(alias) = broker_topic_aliases.get(&request.filter) {
-            // use this alias
-            set_alias = false;
-            Some(*alias)
-        } else {
+    let (set_alias, topic_alias) = match broker_topic_aliases.get(&request.filter) {
+        Some(alias) => (false, Some(*alias)),
+        None => {
             let alias_to_use = used_aliases.insert(());
             if alias_to_use > max_alias as usize {
                 used_aliases.remove(alias_to_use);
-                None
+                (false, None)
             } else {
                 let alias_to_use = alias_to_use as u16;
                 broker_topic_aliases.insert(request.filter.clone(), alias_to_use);
-                Some(alias_to_use)
+                (true, Some(alias_to_use))
             }
         }
-    } else {
-        None
     };
-
-    dbg!(topic_alias);
-    dbg!(set_alias);
-    dbg!(&request);
 
     // Fill and notify device data
     let forwards = publishes.into_iter().map(|(mut publish, offset)| {
@@ -1371,18 +1362,17 @@ fn forward_device_data(
             };
 
             if !set_alias {
-                dbg!(publish.topic.clear())
+                publish.topic.clear()
             }
-
             props = Some(newprops);
         }
 
-        dbg!(Forward {
+        Forward {
             cursor: offset,
             size: 0,
             publish,
             props,
-        })
+        }
     });
 
     let (len, inflight) = outgoing.push_forwards(forwards, qos, filter_idx);
