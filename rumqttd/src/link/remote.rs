@@ -1,8 +1,8 @@
 use crate::link::local::{Link, LinkError, LinkRx, LinkTx};
 use crate::link::network;
 use crate::link::network::Network;
-use crate::protocol::{Connect, Packet, Protocol};
-use crate::router::{Event, Notification};
+use crate::protocol::{ConnAck, Connect, ConnectReturnCode, Packet, Protocol};
+use crate::router::{Ack, Event, Notification};
 use crate::{ConnectionId, ConnectionSettings};
 
 use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
@@ -56,6 +56,7 @@ pub struct RemoteLink<P> {
     link_rx: LinkRx,
     notifications: VecDeque<Notification>,
     reconnect_rx: Receiver<(Connect, Network<P>)>,
+    will_delay: Duration,
 }
 
 impl<P: Protocol> RemoteLink<P> {
@@ -66,6 +67,7 @@ impl<P: Protocol> RemoteLink<P> {
         mut network: Network<P>,
         packet: Packet,
         reconnect_rx: Receiver<(Connect, Network<P>)>,
+        will_delay: u32,
     ) -> Result<RemoteLink<P>, Error> {
         let dynamic_filters = config.dynamic_filters;
         let (connect, lastwill, login) = match packet {
@@ -124,6 +126,8 @@ impl<P: Protocol> RemoteLink<P> {
             network.write(packet).await?;
         }
 
+        let will_delay = Duration::from_secs(will_delay as u64);
+
         Ok(RemoteLink {
             connect,
             client_id,
@@ -133,16 +137,29 @@ impl<P: Protocol> RemoteLink<P> {
             link_rx,
             notifications: VecDeque::with_capacity(100),
             reconnect_rx,
+            will_delay,
         })
     }
 
     async fn wait_for_reconnection(&mut self) -> Result<(), Error> {
         let (connect, network) =
-            tokio::time::timeout(Duration::from_secs(5), self.reconnect_rx.recv_async()).await??;
+            tokio::time::timeout(self.will_delay, self.reconnect_rx.recv_async()).await??;
 
-        // let (connect, network) = self.reconnect_rx.recv_timeout(Duration::from_secs(5))?;
-        self.connect = connect;
         self.network = network;
+        self.connect = connect;
+
+        let ack = Notification::DeviceAck(Ack::ConnAck(
+            self.connection_id,
+            ConnAck {
+                session_present: true,
+                code: ConnectReturnCode::Success,
+            },
+        ));
+
+        if let Some(packet) = ack.into() {
+            self.network.write(packet).await?;
+        }
+
         Ok(())
     }
 
@@ -154,9 +171,9 @@ impl<P: Protocol> RemoteLink<P> {
         loop {
             select! {
                 o = self.network.read() => {
-
                     if o.is_err() {
                         self.wait_for_reconnection().await?;
+                        continue
                     }
 
                     let packet = o?;

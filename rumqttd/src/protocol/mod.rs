@@ -89,7 +89,7 @@ pub struct LastWill {
     pub retain: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LastWillProperties {
     pub delay_interval: Option<u32>,
     pub payload_format_indicator: Option<u8>,

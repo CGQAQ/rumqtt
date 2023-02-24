@@ -398,19 +398,21 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                     let mut net = Network::new(network, config.max_payload_size, 100, protocol);
                     let packet =
                         remote::mqtt_connect(config.connection_timeout_ms.into(), &mut net).await?;
-                    dbg!("got packet");
                     let mut conns = self.existing_conn.lock().await;
-                    if let Packet::Connect(ref connect, ..) = packet {
+                    if let Packet::Connect(ref connect, _, _, ref willprops, _) = packet {
                         if let (Some(sender), false) =
                             (conns.get(&connect.client_id), connect.clean_session)
                         {
-                            dbg!(sender.try_send((connect.clone(), net))).unwrap();
+                            sender.try_send((connect.clone(), net)).unwrap();
                         } else {
-                            dbg!("creating new");
                             let (reconnection_tx, reconnection_rx) =
                                 flume::bounded::<(Connect, Network<_>)>(1);
                             conns.insert(connect.client_id.clone(), reconnection_tx);
-                            dbg!("inserted!");
+                            let will_delay = willprops
+                                .clone()
+                                .unwrap_or_default()
+                                .delay_interval
+                                .unwrap_or(0);
                             task::spawn(
                                 remote(
                                     config,
@@ -420,6 +422,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                                     reconnection_rx,
                                     packet,
                                     self.existing_conn.clone(),
+                                    will_delay,
                                 )
                                 .instrument(tracing::error_span!(
                                     "remote_link",
@@ -451,6 +454,7 @@ async fn remote<P: Protocol>(
     reconnection_rx: Receiver<(Connect, Network<P>)>,
     packet: Packet,
     conns: Arc<Mutex<HashMap<String, Sender<(Connect, Network<P>)>>>>,
+    will_delay: u32,
 ) {
     // Start the link
     let mut link = match RemoteLink::new(
@@ -460,6 +464,7 @@ async fn remote<P: Protocol>(
         network,
         packet,
         reconnection_rx,
+        will_delay,
     )
     .await
     {
