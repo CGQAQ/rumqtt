@@ -1,7 +1,7 @@
 use crate::link::local::{Link, LinkError, LinkRx, LinkTx};
 use crate::link::network;
 use crate::link::network::Network;
-use crate::protocol::{Connect, LastWill, LastWillProperties, Packet, Protocol};
+use crate::protocol::{Connect, ConnectProperties, LastWill, LastWillProperties, Packet, Protocol};
 use crate::router::{Event, Notification};
 use crate::{ConnectionId, ConnectionSettings};
 
@@ -112,6 +112,15 @@ impl<P: Protocol> RemoteLink<P> {
             }
         }
 
+        let recv_max = if let Some(ConnectProperties {
+            receive_maximum, ..
+        }) = props
+        {
+            receive_maximum
+        } else {
+            None
+        };
+
         // When keep_alive feature is disabled client can live forever, which is not good in
         // distributed broker context so currenlty we don't allow it.
         if connect.keep_alive == 0 {
@@ -138,6 +147,7 @@ impl<P: Protocol> RemoteLink<P> {
             clean_session,
             lastwill,
             dynamic_filters,
+            recv_max,
         )?;
         let id = link_rx.id();
         Span::current().record("connection_id", id);
