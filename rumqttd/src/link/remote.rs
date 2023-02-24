@@ -5,7 +5,7 @@ use crate::protocol::{Connect, Packet, Protocol};
 use crate::router::{Event, Notification};
 use crate::{ConnectionId, ConnectionSettings};
 
-use flume::{RecvError, SendError, Sender, TrySendError};
+use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
@@ -30,6 +30,8 @@ pub enum Error {
     Send(#[from] SendError<(ConnectionId, Event)>),
     #[error("Channel recv error")]
     Recv(#[from] RecvError),
+    #[error("Channel recv error")]
+    RecvTimeout(#[from] RecvTimeoutError),
     #[error("Persistent session requires valid client id")]
     InvalidClientId,
     #[error("Unexpected router message")]
@@ -53,6 +55,7 @@ pub struct RemoteLink<P> {
     link_tx: LinkTx,
     link_rx: LinkRx,
     notifications: VecDeque<Notification>,
+    reconnect_rx: Receiver<(Connect, Network<P>)>,
 }
 
 impl<P: Protocol> RemoteLink<P> {
@@ -61,24 +64,15 @@ impl<P: Protocol> RemoteLink<P> {
         router_tx: Sender<(ConnectionId, Event)>,
         tenant_id: Option<String>,
         mut network: Network<P>,
+        packet: Packet,
+        reconnect_rx: Receiver<(Connect, Network<P>)>,
     ) -> Result<RemoteLink<P>, Error> {
-        // Wait for MQTT connect packet and error out if it's not received in time to prevent
-        // DOS attacks by filling total connections that the server can handle with idle open
-        // connections which results in server rejecting new connections
-        let connection_timeout_ms = config.connection_timeout_ms.into();
         let dynamic_filters = config.dynamic_filters;
-        let packet = time::timeout(Duration::from_millis(connection_timeout_ms), async {
-            let packet = network.read().await?;
-            Ok::<_, network::Error>(packet)
-        })
-        .await??;
-
         let (connect, lastwill, login) = match packet {
             Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
-
         // If authentication is configured in config file check for username and password
         if let Some(auths) = &config.auth {
             // if authentication is configured and connect packet doesn't have login details return
@@ -138,7 +132,18 @@ impl<P: Protocol> RemoteLink<P> {
             link_tx,
             link_rx,
             notifications: VecDeque::with_capacity(100),
+            reconnect_rx,
         })
+    }
+
+    async fn wait_for_reconnection(&mut self) -> Result<(), Error> {
+        let (connect, network) =
+            tokio::time::timeout(Duration::from_secs(5), self.reconnect_rx.recv_async()).await??;
+
+        // let (connect, network) = self.reconnect_rx.recv_timeout(Duration::from_secs(5))?;
+        self.connect = connect;
+        self.network = network;
+        Ok(())
     }
 
     pub async fn start(&mut self) -> Result<(), Error> {
@@ -149,6 +154,11 @@ impl<P: Protocol> RemoteLink<P> {
         loop {
             select! {
                 o = self.network.read() => {
+
+                    if o.is_err() {
+                        self.wait_for_reconnection().await?;
+                    }
+
                     let packet = o?;
                     let len = {
                         let mut buffer = self.link_tx.buffer();
@@ -182,5 +192,28 @@ impl<P: Protocol> RemoteLink<P> {
                 }
             }
         }
+    }
+}
+
+pub async fn mqtt_connect<P>(
+    connection_timeout_ms: u64,
+    network: &mut Network<P>,
+) -> Result<Packet, Error>
+where
+    P: Protocol,
+{
+    // Wait for MQTT connect packet and error out if it's not received in time to prevent
+    // DOS attacks by filling total connections that the server can handle with idle open
+    // connections which results in server rejecting new connections
+    let connection_timeout_ms = connection_timeout_ms.into();
+    let packet = time::timeout(Duration::from_millis(connection_timeout_ms), async {
+        let packet = network.read().await?;
+        Ok::<_, network::Error>(packet)
+    })
+    .await??;
+
+    match packet {
+        Packet::Connect(..) => Ok(packet),
+        packet => return Err(Error::NotConnectPacket(packet)),
     }
 }

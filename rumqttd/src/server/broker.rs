@@ -1,5 +1,3 @@
-use crate::link::alerts::{self};
-use crate::link::bridge;
 use crate::link::console::ConsoleLink;
 use crate::link::network::{Network, N};
 use crate::link::remote::{self, RemoteLink};
@@ -9,13 +7,15 @@ use crate::protocol::v4::V4;
 use crate::protocol::v5::V5;
 #[cfg(feature = "websockets")]
 use crate::protocol::ws::Ws;
-use crate::protocol::Protocol;
+use crate::protocol::{Connect, Packet, Protocol};
 #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
 use crate::server::tls::{self, TLSAcceptor};
-use crate::{meters, ConnectionSettings, Filter, GetMeter, Meter};
-use flume::{RecvError, SendError, Sender};
+use crate::{alerts, meters, ConnectionSettings, Filter, GetMeter, Meter};
+use flume::{Receiver, RecvError, SendError, Sender};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, field, info, Instrument};
 #[cfg(feature = "websockets")]
 use websocket_codec::MessageCodec;
@@ -25,8 +25,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use std::time::Duration;
 use std::{io, thread};
 
-use crate::link::console;
 use crate::link::local::{self, Link, LinkRx, LinkTx};
+use crate::link::{bridge, console};
 use crate::router::{Disconnection, Event, Router};
 use crate::{Config, ConnectionId, ServerSettings};
 use tokio::net::{TcpListener, TcpStream};
@@ -185,7 +185,7 @@ impl Broker {
         // spawn servers in a separate thread
         for (_, config) in self.config.v4.clone() {
             let server_thread = thread::Builder::new().name(config.name.clone());
-            let server = Server::new(config, self.router_tx.clone(), V4);
+            let mut server = Server::new(config, self.router_tx.clone(), V4);
             server_thread.spawn(move || {
                 let mut runtime = tokio::runtime::Builder::new_current_thread();
                 let runtime = runtime.enable_all().build().unwrap();
@@ -201,7 +201,7 @@ impl Broker {
         if let Some(v5_config) = &self.config.v5 {
             for (_, config) in v5_config.clone() {
                 let server_thread = thread::Builder::new().name(config.name.clone());
-                let server = Server::new(config, self.router_tx.clone(), V5);
+                let mut server = Server::new(config, self.router_tx.clone(), V5);
                 server_thread.spawn(move || {
                     let mut runtime = tokio::runtime::Builder::new_current_thread();
                     let runtime = runtime.enable_all().build().unwrap();
@@ -314,6 +314,7 @@ struct Server<P> {
     config: ServerSettings,
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
+    existing_conn: Arc<Mutex<HashMap<String, Sender<(Connect, Network<P>)>>>>,
 }
 
 impl<P: Protocol + Clone + Send + 'static> Server<P> {
@@ -326,6 +327,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             config,
             router_tx,
             protocol,
+            existing_conn: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 
@@ -343,7 +345,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         Ok((Box::new(stream), None))
     }
 
-    async fn start(&self, link_type: LinkType) -> Result<(), Error> {
+    async fn start(&mut self, link_type: LinkType) -> Result<(), Error> {
         let listener = TcpListener::bind(&self.config.listen).await?;
         let delay = Duration::from_millis(self.config.next_connection_delay_ms);
         let mut count: usize = 0;
@@ -354,6 +356,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             listen_addr = self.config.listen.to_string(),
             "Listening for remote connections",
         );
+
         loop {
             // Await new network connection.
             let (stream, addr) = match listener.accept().await {
@@ -381,6 +384,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             count += 1;
 
             let protocol = self.protocol.clone();
+
             match link_type {
                 #[cfg(feature = "websockets")]
                 LinkType::Shadow => task::spawn(
@@ -390,16 +394,43 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         connection_id = field::Empty
                     )),
                 ),
-                LinkType::Remote => task::spawn(
-                    remote(config, tenant_id.clone(), router_tx, network, protocol).instrument(
-                        tracing::error_span!(
-                            "remote_link",
-                            ?tenant_id,
-                            client_id = field::Empty,
-                            connection_id = field::Empty,
-                        ),
-                    ),
-                ),
+                LinkType::Remote => {
+                    let mut net = Network::new(network, config.max_payload_size, 100, protocol);
+                    let packet =
+                        remote::mqtt_connect(config.connection_timeout_ms.into(), &mut net).await?;
+                    dbg!("got packet");
+                    let mut conns = self.existing_conn.lock().await;
+                    if let Packet::Connect(ref connect, ..) = packet {
+                        if let (Some(sender), false) =
+                            (conns.get(&connect.client_id), connect.clean_session)
+                        {
+                            dbg!(sender.try_send((connect.clone(), net))).unwrap();
+                        } else {
+                            dbg!("creating new");
+                            let (reconnection_tx, reconnection_rx) =
+                                flume::bounded::<(Connect, Network<_>)>(1);
+                            conns.insert(connect.client_id.clone(), reconnection_tx);
+                            dbg!("inserted!");
+                            task::spawn(
+                                remote(
+                                    config,
+                                    tenant_id.clone(),
+                                    router_tx,
+                                    net,
+                                    reconnection_rx,
+                                    packet,
+                                    self.existing_conn.clone(),
+                                )
+                                .instrument(tracing::error_span!(
+                                    "remote_link",
+                                    ?tenant_id,
+                                    client_id = field::Empty,
+                                    connection_id = field::Empty,
+                                )),
+                            );
+                        };
+                    }
+                }
             };
 
             time::sleep(delay).await;
@@ -416,19 +447,28 @@ async fn remote<P: Protocol>(
     config: Arc<ConnectionSettings>,
     tenant_id: Option<String>,
     router_tx: Sender<(ConnectionId, Event)>,
-    stream: Box<dyn N>,
-    protocol: P,
+    network: Network<P>,
+    reconnection_rx: Receiver<(Connect, Network<P>)>,
+    packet: Packet,
+    conns: Arc<Mutex<HashMap<String, Sender<(Connect, Network<P>)>>>>,
 ) {
-    let network = Network::new(stream, config.max_payload_size, 100, protocol);
     // Start the link
-    let mut link =
-        match RemoteLink::new(config, router_tx.clone(), tenant_id.clone(), network).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!(error=?e, "Remote link error");
-                return;
-            }
-        };
+    let mut link = match RemoteLink::new(
+        config,
+        router_tx.clone(),
+        tenant_id.clone(),
+        network,
+        packet,
+        reconnection_rx,
+    )
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error=?e, "Remote link error");
+            return;
+        }
+    };
 
     let client_id = link.client_id.to_owned();
     let connection_id = link.connection_id;
@@ -446,6 +486,7 @@ async fn remote<P: Protocol>(
         // Any other error
         Err(e) => {
             error!(error=?e, "Disconnected!!");
+            conns.lock().await.remove(&client_id);
             execute_will = true;
         }
     };
