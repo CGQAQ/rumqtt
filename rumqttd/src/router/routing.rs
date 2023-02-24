@@ -599,10 +599,13 @@ impl Router {
                         let protocol::Filter {
                             path: filter,
                             qos,
-                            nolocal,
                             preserve_retain,
                             retain_forward_rule,
+                            ..
                         } = f;
+
+                        let subscription_exists =
+                            self.connections[id].subscriptions.contains(filter);
 
                         let sub_id = if let Some(ref props) = sub_props {
                             props.id
@@ -618,10 +621,14 @@ impl Router {
                             filter.clone(),
                             sub_id,
                             *qos as u8,
-                            *nolocal,
+                            *preserve_retain,
                         );
-                        self.datalog
-                            .handle_retained_messages(filter, &mut self.notifications);
+                        self.datalog.handle_retained_messages(
+                            filter,
+                            &mut self.notifications,
+                            subscription_exists,
+                            retain_forward_rule,
+                        );
 
                         let code = match qos {
                             QoS::AtMostOnce => SubscribeReasonCode::QoS0,
@@ -855,7 +862,7 @@ impl Router {
         filter: String,
         subscription_id: Option<usize>,
         qos: u8,
-        nolocal: bool,
+        preserve_retain: bool,
     ) {
         // Add connection id to subscription list
         match self.subscription_map.get_mut(&filter) {
@@ -880,7 +887,7 @@ impl Router {
                 cursor,
                 read_count: 0,
                 max_count: 100,
-                nolocal,
+                preserve_retain,
             };
 
             self.scheduler.track(id, request);
@@ -1306,15 +1313,18 @@ fn forward_device_data(
         .into_iter()
         .map(|((mut publish, pubprops), offset)| {
             publish.qos = protocol::qos(qos).unwrap();
-            let pubprops = if let Some(subid) = connection.subscription_ids.get(&request.filter) {
+            let mut pubprops: Option<PublishProperties> = None;
+            if let Some(subid) = connection.subscription_ids.get(&request.filter) {
                 // add subid to publish property here!
 
                 let mut prop = pubprops.unwrap_or_default();
                 prop.subscription_identifiers.push(*subid);
-                Some(prop)
-            } else {
-                None
-            };
+                pubprops = Some(prop);
+            }
+
+            if !request.preserve_retain {
+                publish.retain = false
+            }
 
             Forward {
                 cursor: offset,

@@ -12,6 +12,7 @@ use std::{io, str::Utf8Error, string::FromUtf8Error};
 /// MQTT is the core protocol that this broker supports, a lot of structs closely
 /// map to what MQTT specifies in its protocol
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
 
 use crate::Notification;
 
@@ -306,7 +307,7 @@ pub struct Filter {
     pub retain_forward_rule: RetainForwardRule,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetainForwardRule {
     OnEverySubscribe,
     OnNewSubscribe,

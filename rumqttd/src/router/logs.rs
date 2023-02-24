@@ -4,7 +4,7 @@ use tracing::trace;
 
 use crate::protocol::{
     matches, ConnAck, PingResp, PubAck, PubComp, PubRec, PubRel, Publish, PublishProperties,
-    SubAck, UnsubAck,
+    RetainForwardRule, SubAck, UnsubAck,
 };
 use crate::router::{DataRequest, FilterIdx, SubscriptionMeter, Waiters};
 use crate::{ConnectionId, Filter, Offset, RouterConfig, Topic};
@@ -218,8 +218,20 @@ impl DataLog {
         &mut self,
         filter: &str,
         notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
+        subscription_exists: bool,
+        retain_forward_rule: &RetainForwardRule,
     ) {
         trace!(info = "retain-msg", filter = &filter);
+
+        match retain_forward_rule {
+            RetainForwardRule::OnEverySubscribe => {}
+            RetainForwardRule::OnNewSubscribe => {
+                if subscription_exists {
+                    return;
+                }
+            }
+            RetainForwardRule::Never => return,
+        }
 
         let idx = self.filter_indexes.get(filter).unwrap();
 
