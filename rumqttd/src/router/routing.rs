@@ -1,6 +1,6 @@
 use crate::protocol::{
     ConnAck, ConnectReturnCode, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason,
-    PubRel, PubRelReason, Publish, QoS, SubAck, SubscribeReasonCode, UnsubAck,
+    PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck, SubscribeReasonCode, UnsubAck,
 };
 use crate::router::alertlog::{AlertError, AlertEvent};
 use crate::router::graveyard::SavedState;
@@ -489,7 +489,7 @@ impl Router {
 
         for packet in packets.drain(0..) {
             match packet {
-                Packet::Publish(publish, _) => {
+                Packet::Publish(publish, props) => {
                     let span =
                         tracing::info_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
@@ -542,6 +542,17 @@ impl Router {
                     };
 
                     self.router_meters.total_publishes += 1;
+
+                    if let Some(PublishProperties {
+                        payload_format_indicator: Some(0x01),
+                        ..
+                    }) = props
+                    {
+                        if std::str::from_utf8(&publish.payload).is_err() {
+                            disconnect = true
+                            // add a reason code here
+                        }
+                    }
 
                     // Try to append publish to commitlog
                     match append_to_commitlog(

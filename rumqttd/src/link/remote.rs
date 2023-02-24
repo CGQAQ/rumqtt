@@ -1,7 +1,7 @@
 use crate::link::local::{Link, LinkError, LinkRx, LinkTx};
 use crate::link::network;
 use crate::link::network::Network;
-use crate::protocol::{Connect, Packet, Protocol};
+use crate::protocol::{Connect, LastWill, LastWillProperties, Packet, Protocol};
 use crate::router::{Event, Notification};
 use crate::{ConnectionId, ConnectionSettings};
 
@@ -42,6 +42,8 @@ pub enum Error {
     TrySend(#[from] TrySendError<(ConnectionId, Event)>),
     #[error("Link error = {0}")]
     Link(#[from] LinkError),
+    #[error("Invalid payload format")]
+    PayloadFormatInvalid,
 }
 
 /// Orchestrates between Router and Network.
@@ -73,8 +75,10 @@ impl<P: Protocol> RemoteLink<P> {
         })
         .await??;
 
-        let (connect, lastwill, login) = match packet {
-            Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
+        let (connect, props, lastwill, willprops, login) = match packet {
+            Packet::Connect(connect, props, lastwill, willprops, login) => {
+                (connect, props, lastwill, willprops, login)
+            }
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
@@ -93,6 +97,18 @@ impl<P: Protocol> RemoteLink<P> {
                 }
             } else {
                 return Err(Error::InvalidAuth);
+            }
+        }
+
+        if let Some(LastWillProperties {
+            payload_format_indicator: Some(0x01),
+            ..
+        }) = willprops
+        {
+            if let Some(LastWill { topic, message, .. }) = &lastwill {
+                if std::str::from_utf8(topic).is_err() || std::str::from_utf8(message).is_err() {
+                    return Err(Error::PayloadFormatInvalid);
+                }
             }
         }
 
