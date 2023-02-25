@@ -3,6 +3,7 @@ use crate::link::network;
 use crate::link::network::Network;
 use crate::protocol::{ConnAck, Connect, ConnectReturnCode, Packet, Protocol};
 use crate::router::{Ack, Event, Notification};
+use crate::server::Session;
 use crate::{ConnectionId, ConnectionSettings};
 
 use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
@@ -32,6 +33,8 @@ pub enum Error {
     Recv(#[from] RecvError),
     #[error("Channel recv error")]
     RecvTimeout(#[from] RecvTimeoutError),
+    #[error("Got new session, disconnecting old one")]
+    SessionEnd,
     #[error("Persistent session requires valid client id")]
     InvalidClientId,
     #[error("Unexpected router message")]
@@ -48,14 +51,14 @@ pub enum Error {
 
 /// Orchestrates between Router and Network.
 pub struct RemoteLink<P> {
-    connect: Connect,
+    pub(crate) connect: Connect,
     pub(crate) client_id: String,
     pub(crate) connection_id: ConnectionId,
     network: Network<P>,
     link_tx: LinkTx,
     link_rx: LinkRx,
     notifications: VecDeque<Notification>,
-    reconnect_rx: Receiver<(Connect, Network<P>)>,
+    reconnect_rx: Receiver<Session<P>>,
     will_delay: Duration,
 }
 
@@ -66,12 +69,13 @@ impl<P: Protocol> RemoteLink<P> {
         tenant_id: Option<String>,
         mut network: Network<P>,
         packet: Packet,
-        reconnect_rx: Receiver<(Connect, Network<P>)>,
-        will_delay: u32,
+        reconnect_rx: Receiver<Session<P>>,
     ) -> Result<RemoteLink<P>, Error> {
         let dynamic_filters = config.dynamic_filters;
-        let (connect, lastwill, login) = match packet {
-            Packet::Connect(connect, _, lastwill, _, login) => (connect, lastwill, login),
+        let (connect, lastwill, willprops, login) = match packet {
+            Packet::Connect(connect, _, lastwill, willprops, login) => {
+                (connect, lastwill, willprops, login)
+            }
             packet => return Err(Error::NotConnectPacket(packet)),
         };
         Span::current().record("client_id", &connect.client_id);
@@ -126,6 +130,11 @@ impl<P: Protocol> RemoteLink<P> {
             network.write(packet).await?;
         }
 
+        let will_delay = willprops
+            .clone()
+            .unwrap_or_default()
+            .delay_interval
+            .unwrap_or(0);
         let will_delay = Duration::from_secs(will_delay as u64);
 
         Ok(RemoteLink {
@@ -142,11 +151,19 @@ impl<P: Protocol> RemoteLink<P> {
     }
 
     async fn wait_for_reconnection(&mut self) -> Result<(), Error> {
-        let (connect, network) =
-            tokio::time::timeout(self.will_delay, self.reconnect_rx.recv_async()).await??;
+        let (packet, network) =
+            match tokio::time::timeout(self.will_delay, self.reconnect_rx.recv_async()).await?? {
+                Session::Clean => return Err(Error::SessionEnd),
+                Session::Existing(packet, network) => (packet, network),
+            };
 
         self.network = network;
-        self.connect = connect;
+        if let Packet::Connect(connect, _, _, willprops, _) = packet {
+            self.connect = connect;
+            self.will_delay = Duration::from_secs(
+                willprops.unwrap_or_default().delay_interval.unwrap_or(0) as u64,
+            );
+        }
 
         let ack = Notification::DeviceAck(Ack::ConnAck(
             self.connection_id,
@@ -222,7 +239,6 @@ where
     // Wait for MQTT connect packet and error out if it's not received in time to prevent
     // DOS attacks by filling total connections that the server can handle with idle open
     // connections which results in server rejecting new connections
-    let connection_timeout_ms = connection_timeout_ms.into();
     let packet = time::timeout(Duration::from_millis(connection_timeout_ms), async {
         let packet = network.read().await?;
         Ok::<_, network::Error>(packet)
@@ -231,6 +247,6 @@ where
 
     match packet {
         Packet::Connect(..) => Ok(packet),
-        packet => return Err(Error::NotConnectPacket(packet)),
+        packet => Err(Error::NotConnectPacket(packet)),
     }
 }

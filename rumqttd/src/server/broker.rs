@@ -7,7 +7,7 @@ use crate::protocol::v4::V4;
 use crate::protocol::v5::V5;
 #[cfg(feature = "websockets")]
 use crate::protocol::ws::Ws;
-use crate::protocol::{Connect, Packet, Protocol};
+use crate::protocol::{Packet, Protocol};
 #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
 use crate::server::tls::{self, TLSAcceptor};
 use crate::{alerts, meters, ConnectionSettings, Filter, GetMeter, Meter};
@@ -310,11 +310,16 @@ pub enum LinkType {
     Remote,
 }
 
+pub enum Session<P> {
+    Clean,
+    Existing(Packet, Network<P>),
+}
+
 struct Server<P> {
     config: ServerSettings,
     router_tx: Sender<(ConnectionId, Event)>,
     protocol: P,
-    existing_conn: Arc<Mutex<HashMap<String, Sender<(Connect, Network<P>)>>>>,
+    existing_conn: Arc<Mutex<HashMap<String, Sender<Session<P>>>>>,
 }
 
 impl<P: Protocol + Clone + Send + 'static> Server<P> {
@@ -399,20 +404,21 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                     let packet =
                         remote::mqtt_connect(config.connection_timeout_ms.into(), &mut net).await?;
                     let mut conns = self.existing_conn.lock().await;
-                    if let Packet::Connect(ref connect, _, _, ref willprops, _) = packet {
-                        if let (Some(sender), false) =
-                            (conns.get(&connect.client_id), connect.clean_session)
-                        {
-                            sender.try_send((connect.clone(), net)).unwrap();
+                    if let Packet::Connect(ref connect, ..) = packet {
+                        let sender = conns.get(&connect.client_id);
+
+                        if sender.is_some() && !connect.clean_session {
+                            let sender = sender.unwrap();
+                            let session = Session::Existing(packet, net);
+                            sender.try_send(session).unwrap();
                         } else {
+                            if let Some(sender) = sender {
+                                let session = Session::Clean;
+                                sender.try_send(session).unwrap();
+                            };
                             let (reconnection_tx, reconnection_rx) =
-                                flume::bounded::<(Connect, Network<_>)>(1);
+                                flume::bounded::<Session<P>>(1);
                             conns.insert(connect.client_id.clone(), reconnection_tx);
-                            let will_delay = willprops
-                                .clone()
-                                .unwrap_or_default()
-                                .delay_interval
-                                .unwrap_or(0);
                             task::spawn(
                                 remote(
                                     config,
@@ -422,7 +428,6 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                                     reconnection_rx,
                                     packet,
                                     self.existing_conn.clone(),
-                                    will_delay,
                                 )
                                 .instrument(tracing::error_span!(
                                     "remote_link",
@@ -451,10 +456,9 @@ async fn remote<P: Protocol>(
     tenant_id: Option<String>,
     router_tx: Sender<(ConnectionId, Event)>,
     network: Network<P>,
-    reconnection_rx: Receiver<(Connect, Network<P>)>,
+    reconnection_rx: Receiver<Session<P>>,
     packet: Packet,
-    conns: Arc<Mutex<HashMap<String, Sender<(Connect, Network<P>)>>>>,
-    will_delay: u32,
+    conns: Arc<Mutex<HashMap<String, Sender<Session<P>>>>>,
 ) {
     // Start the link
     let mut link = match RemoteLink::new(
@@ -464,7 +468,6 @@ async fn remote<P: Protocol>(
         network,
         packet,
         reconnection_rx,
-        will_delay,
     )
     .await
     {
@@ -491,7 +494,15 @@ async fn remote<P: Protocol>(
         // Any other error
         Err(e) => {
             error!(error=?e, "Disconnected!!");
-            conns.lock().await.remove(&client_id);
+            match e {
+                remote::Error::Timeout(_) => {
+                    conns.lock().await.remove(&client_id);
+                }
+                remote::Error::SessionEnd => {
+                    info!("got new session for {client_id}");
+                }
+                _ => {}
+            }
             execute_will = true;
         }
     };
