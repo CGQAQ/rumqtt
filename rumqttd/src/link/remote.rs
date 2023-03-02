@@ -153,7 +153,12 @@ impl<P: Protocol> RemoteLink<P> {
         Span::current().record("connection_id", id);
 
         if let Some(packet) = notification.into() {
-            network.write(packet).await?;
+            if let Packet::ConnAck(pac, props) = packet {
+                let mut new_props = props.unwrap_or_default();
+                new_props.max_packet_size = Some(config.max_payload_size as u32);
+                let new_packet = Packet::ConnAck(pac, Some(new_props));
+                network.write(new_packet).await?;
+            };
         }
 
         Ok(RemoteLink {

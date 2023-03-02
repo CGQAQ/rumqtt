@@ -1281,6 +1281,8 @@ fn forward_device_data(
 
     // Fill and notify device data
     let forwards = publishes.into_iter().map(|(mut publish, offset)| {
+        // get publish len and filter packets based on recv max!
+        // let packet_len = publish::len(publish, None);
         publish.qos = protocol::qos(qos).unwrap();
         Forward {
             cursor: offset,
